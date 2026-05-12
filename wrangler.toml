@@ -1,0 +1,9 @@
+name = "tennetsac-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-09"
+compatibility_flags = ["nodejs_compat"]
+
+# Default — override in production via `wrangler secret put TENNETSAC_API`
+# or set a different value in the dashboard under Settings > Variables.
+[vars]
+TENNETSAC_API = "https://stlin-tennetsac.hf.space"
