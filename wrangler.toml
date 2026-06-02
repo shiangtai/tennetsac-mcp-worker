@@ -1,4 +1,4 @@
-name = "tennetsac-mcp"
+name = "tennetsac-mcp-worker"
 main = "src/index.ts"
 compatibility_date = "2025-04-09"
 compatibility_flags = ["nodejs_compat"]
