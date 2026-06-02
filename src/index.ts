@@ -1,17 +1,20 @@
 /**
  * TeNNet-SAC MCP Server — Cloudflare Workers
  *
- * Implements the Model Context Protocol (Streamable HTTP transport, 2024-11-05)
- * as a stateless Cloudflare Worker.  Every POST carries one complete JSON-RPC
- * message and receives a JSON response — no SSE streaming or Durable Objects
- * are required for these tool-call workloads.
+ * MCP Streamable HTTP transport (protocol version 2025-03-26).
+ * Stateless — no Durable Objects or session management required.
  *
- * All computation happens in the HuggingFace-hosted backend; this worker is
- * a pure protocol adapter + HTTP proxy.
+ * POST /   — MCP JSON-RPC requests.
+ *            Responds as SSE (text/event-stream) when client sends
+ *            Accept: text/event-stream, otherwise plain JSON.
+ * GET  /   — Opens an SSE stream for server-initiated messages.
+ *            Returns an empty stream immediately (this server is stateless
+ *            and never pushes server-initiated messages).
+ * DELETE / — Close session (no-op for stateless server, always succeeds).
  *
  * ⚠️  Timeout note
- *   Regular tools  : up to 180 s — fine on Workers Paid (Unbound).
- *   compute_nrtl_parameters: up to 600 s — may exceed Workers wall-clock
+ *   Regular tools           : up to 180 s — fine on Workers Paid (Unbound).
+ *   compute_nrtl_parameters : up to 600 s — may exceed Workers wall-clock
  *   limits on some plans.  Route NRTL calls through a queue worker if needed.
  *
  * Deploy
@@ -26,6 +29,7 @@ export interface Env {
   TENNETSAC_API?: string;
 }
 
+const PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_API = "https://stlin-tennetsac.hf.space";
 const TIMEOUT_MS = 180_000;
 const NRTL_TIMEOUT_MS = 600_000;
@@ -157,10 +161,30 @@ const TOOLS = [
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, Accept",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id",
 };
 
+/** True when the client accepts an SSE stream in response. */
+function wantsSSE(request: Request): boolean {
+  return (request.headers.get("Accept") ?? "").includes("text/event-stream");
+}
+
+/** Wrap a JSON-RPC object as a single SSE event and close the stream. */
+function sseResp(body: unknown, status = 200): Response {
+  const payload = `event: message\ndata: ${JSON.stringify(body)}\n\n`;
+  return new Response(payload, {
+    status,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+/** Plain JSON response. */
 function jsonResp(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -168,12 +192,14 @@ function jsonResp(body: unknown, status = 200): Response {
   });
 }
 
-function rpcResult(id: unknown, result: unknown): Response {
-  return jsonResp({ jsonrpc: "2.0", id, result });
+function rpcResult(id: unknown, result: unknown, sse: boolean): Response {
+  const msg = { jsonrpc: "2.0", id, result };
+  return sse ? sseResp(msg) : jsonResp(msg);
 }
 
-function rpcError(id: unknown, code: number, message: string): Response {
-  return jsonResp({ jsonrpc: "2.0", id, error: { code, message } });
+function rpcError(id: unknown, code: number, message: string, sse = false): Response {
+  const msg = { jsonrpc: "2.0", id, error: { code, message } };
+  return sse ? sseResp(msg) : jsonResp(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +281,6 @@ async function callTool(
       );
 
     case "compute_nrtl_parameters": {
-      // Build body with only the keys that were actually supplied
       const body: Record<string, unknown> = {
         smiles: [args.smiles1, args.smiles2],
       };
@@ -266,7 +291,6 @@ async function callTool(
         string,
         unknown
       >;
-      // Drop large verification arrays — not useful in chat
       delete data["verification"];
       return data;
     }
@@ -289,12 +313,33 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
+    // GET: SSE channel for server-initiated messages.
+    // This server is stateless and never sends server-initiated messages,
+    // so we return an empty stream that closes immediately.
+    if (request.method === "GET") {
+      return new Response("", {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          ...CORS_HEADERS,
+        },
+      });
+    }
+
+    // DELETE: close session (no-op for a stateless server).
+    if (request.method === "DELETE") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
     if (request.method !== "POST") {
-      return new Response("Method Not Allowed — send MCP JSON-RPC via POST", {
+      return new Response("Method Not Allowed", {
         status: 405,
         headers: CORS_HEADERS,
       });
     }
+
+    const sse = wantsSSE(request);
 
     // Parse JSON-RPC envelope
     type RpcMsg = { jsonrpc?: string; id?: unknown; method?: string; params?: unknown };
@@ -302,38 +347,33 @@ export default {
     try {
       msg = (await request.json()) as RpcMsg;
     } catch {
-      return rpcError(null, -32700, "Parse error");
+      return rpcError(null, -32700, "Parse error", sse);
     }
 
     if (msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
-      return rpcError(msg.id ?? null, -32600, "Invalid Request");
+      return rpcError(msg.id ?? null, -32600, "Invalid Request", sse);
     }
 
     const { id, method, params } = msg;
 
     switch (method) {
-      // ------------------------------------------------------------------
-      // Lifecycle
-      // ------------------------------------------------------------------
+      // ── Lifecycle ────────────────────────────────────────────────────────
       case "initialize":
         return rpcResult(id, {
-          protocolVersion: "2024-11-05",
+          protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: "TeNNet-SAC", version: "1.0.0" },
-        });
+        }, sse);
 
       case "notifications/initialized":
-        // Notification — no id, no response body expected
         return new Response(null, { status: 204, headers: CORS_HEADERS });
 
       case "ping":
-        return rpcResult(id, {});
+        return rpcResult(id, {}, sse);
 
-      // ------------------------------------------------------------------
-      // Tools
-      // ------------------------------------------------------------------
+      // ── Tools ─────────────────────────────────────────────────────────────
       case "tools/list":
-        return rpcResult(id, { tools: TOOLS });
+        return rpcResult(id, { tools: TOOLS }, sse);
 
       case "tools/call": {
         const { name, arguments: toolArgs } = params as {
@@ -344,17 +384,17 @@ export default {
           const data = await callTool(name, toolArgs ?? {}, apiBase);
           return rpcResult(id, {
             content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          });
+          }, sse);
         } catch (err) {
           return rpcResult(id, {
             content: [{ type: "text", text: String(err) }],
             isError: true,
-          });
+          }, sse);
         }
       }
 
       default:
-        return rpcError(id, -32601, "Method not found");
+        return rpcError(id, -32601, "Method not found", sse);
     }
   },
 };
